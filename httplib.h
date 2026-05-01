@@ -1732,6 +1732,14 @@ public:
 
   bool listen(const std::string &host, int port, int socket_flags = 0);
 
+  // Manual event loop control: call listen_begin() once, then
+  // listen_poll() repeatedly in your own loop, then listen_end().
+  // listen_poll() does one select+accept iteration and returns true
+  // if the server should keep running, false if it was stopped.
+  std::unique_ptr<TaskQueue> listen_begin();
+  bool listen_poll(TaskQueue &task_queue);
+  bool listen_end(std::unique_ptr<TaskQueue> task_queue);
+
   bool is_running() const;
   void wait_until_ready() const;
   void stop();
@@ -11552,79 +11560,79 @@ inline int Server::bind_internal(const std::string &host, int port,
   }
 }
 
-inline bool Server::listen_internal() {
-  if (is_decommissioned) { return false; }
-
-  auto ret = true;
+inline std::unique_ptr<TaskQueue> Server::listen_begin() {
+  if (is_decommissioned) { return nullptr; }
+  std::unique_ptr<TaskQueue> task_queue(new_task_queue());
   is_running_ = true;
-  auto se = detail::scope_exit([&]() { is_running_ = false; });
+  return task_queue;
+}
 
-  {
-    std::unique_ptr<TaskQueue> task_queue(new_task_queue());
+inline bool Server::listen_poll(TaskQueue &task_queue) {
+  if (svr_sock_ == INVALID_SOCKET) { return false; }
 
-    while (svr_sock_ != INVALID_SOCKET) {
-#ifndef _WIN32
-      if (idle_interval_sec_ > 0 || idle_interval_usec_ > 0) {
-#endif
-        auto val = detail::select_read(svr_sock_, idle_interval_sec_,
-                                       idle_interval_usec_);
-        if (val == 0) { // Timeout
-          task_queue->on_idle();
-          continue;
-        }
-#ifndef _WIN32
-      }
-#endif
+  auto val = detail::select_read(svr_sock_, idle_interval_sec_,
+                                 idle_interval_usec_);
+  if (val == 0) { // Timeout
+    task_queue.on_idle();
+    return true;
+  }
+  if (val < 0) { return svr_sock_ != INVALID_SOCKET; }
 
 #if defined _WIN32
-      // sockets connected via WASAccept inherit flags NO_HANDLE_INHERIT,
-      // OVERLAPPED
-      socket_t sock = WSAAccept(svr_sock_, nullptr, nullptr, nullptr, 0);
+  socket_t sock = WSAAccept(svr_sock_, nullptr, nullptr, nullptr, 0);
 #elif defined SOCK_CLOEXEC
-      socket_t sock = accept4(svr_sock_, nullptr, nullptr, SOCK_CLOEXEC);
+  socket_t sock = accept4(svr_sock_, nullptr, nullptr, SOCK_CLOEXEC);
 #else
-      socket_t sock = accept(svr_sock_, nullptr, nullptr);
+  socket_t sock = accept(svr_sock_, nullptr, nullptr);
 #endif
 
-      if (sock == INVALID_SOCKET) {
-        if (errno == EMFILE) {
-          // The per-process limit of open file descriptors has been reached.
-          // Try to accept new connections after a short sleep.
-          std::this_thread::sleep_for(std::chrono::microseconds{1});
-          continue;
-        } else if (errno == EINTR || errno == EAGAIN) {
-          continue;
-        }
-        if (svr_sock_ != INVALID_SOCKET) {
-          detail::close_socket(svr_sock_);
-          ret = false;
-          output_error_log(Error::Connection, nullptr);
-        } else {
-          ; // The server socket was closed by user.
-        }
-        break;
-      }
-
-      detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO,
-                                  read_timeout_sec_, read_timeout_usec_);
-      detail::set_socket_opt_time(sock, SOL_SOCKET, SO_SNDTIMEO,
-                                  write_timeout_sec_, write_timeout_usec_);
-
-      if (tcp_nodelay_) { set_socket_opt(sock, IPPROTO_TCP, TCP_NODELAY, 1); }
-
-      if (!task_queue->enqueue(
-              [this, sock]() { process_and_close_socket(sock); })) {
-        output_error_log(Error::ResourceExhaustion, nullptr);
-        detail::shutdown_socket(sock);
-        detail::close_socket(sock);
-      }
+  if (sock == INVALID_SOCKET) {
+    if (errno == EMFILE) {
+      std::this_thread::sleep_for(std::chrono::microseconds{1});
+      return true;
+    } else if (errno == EINTR || errno == EAGAIN) {
+      return true;
     }
-
-    task_queue->shutdown();
+    if (svr_sock_ != INVALID_SOCKET) {
+      detail::close_socket(svr_sock_);
+      output_error_log(Error::Connection, nullptr);
+    }
+    return false;
   }
 
-  is_decommissioned = !ret;
-  return ret;
+  detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO,
+                              read_timeout_sec_, read_timeout_usec_);
+  detail::set_socket_opt_time(sock, SOL_SOCKET, SO_SNDTIMEO,
+                              write_timeout_sec_, write_timeout_usec_);
+
+  if (tcp_nodelay_) { set_socket_opt(sock, IPPROTO_TCP, TCP_NODELAY, 1); }
+
+  if (!task_queue.enqueue(
+          [this, sock]() { process_and_close_socket(sock); })) {
+    output_error_log(Error::ResourceExhaustion, nullptr);
+    detail::shutdown_socket(sock);
+    detail::close_socket(sock);
+  }
+
+  return true;
+}
+
+inline bool Server::listen_end(std::unique_ptr<TaskQueue> task_queue) {
+  // stop() sets svr_sock_ to INVALID_SOCKET; a fatal accept error doesn't.
+  auto clean = svr_sock_ == INVALID_SOCKET;
+  is_running_ = false;
+  if (task_queue) { task_queue->shutdown(); }
+  is_decommissioned = !clean;
+  return clean;
+}
+
+inline bool Server::listen_internal() {
+  auto task_queue = listen_begin();
+  if (!task_queue) { return false; }
+
+  while (listen_poll(*task_queue)) {}
+
+  return listen_end(std::move(task_queue));
 }
 
 inline bool Server::routing(Request &req, Response &res, Stream &strm) {
